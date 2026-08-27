@@ -74,6 +74,23 @@ numpy, tensorboard (only for the `Event` protobuf).
   in `localStorage` under `runboard:v1`; the ⤓/⤒ topbar buttons export/import
   it as JSON to move between browsers.
 
+## Tests
+
+```bash
+tests/run_all.sh        # backend + headless-Chromium UI suite, hermetic
+```
+
+Both suites build their own synthetic event-file corpus in a tempdir
+(`tests/synthdata.py`) — no dependency on the shared logs. `test_backend.py`
+covers parsing (incremental tail, resume last-wins, replace/truncate reparse,
+stat throttle vs force), full-resolution EMA, spike-preserving downsampling,
+and scanner alias handling. `test_ui.py` starts its own server on a free port
+and drives selection, multi-run charts, rename, pin + drag-reorder, linked
+zoom, log scale, persistence, chart-map GC, the pin/card cap, cadence-honest
+tooltips, the stale-smoothing-response race (via a delayed intercepted
+response), the persisted-selection cap, alias-id migration, and legend chip
+patterns. Run them in the `training` conda env after any change.
+
 ## Palette provenance
 
 The categorical colors and light/dark chrome are the reference dataviz palette

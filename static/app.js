@@ -81,6 +81,14 @@ function loadState() {
     const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
     for (const k of Object.keys(state)) if (k in s) state[k] = s[k];
   } catch (e) {}
+  // persisted/imported state must honor the same cap as interactive
+  // selection — the server truncates at 64 and 65+ would silently drop runs
+  if (!Array.isArray(state.selected)) state.selected = [];
+  if (state.selected.length > MAX_SELECTED) {
+    for (const rid of state.selected.slice(MAX_SELECTED)) delete state.slots[rid];
+    state.selected = state.selected.slice(0, MAX_SELECTED);
+    saveState();
+  }
 }
 
 function effTheme() {
@@ -95,6 +103,31 @@ function runDash(runId) {
   return DASH_CYCLES[Math.floor((state.slots[runId] ?? 0) / 8) % DASH_CYCLES.length];
 }
 function runDashed(runId) { return runDash(runId) != null; }
+
+// Legend/tooltip chip that shows the run's ACTUAL line style: a solid square
+// for cycle 0, otherwise a line sample drawn with the same dash pattern —
+// so slots 8/16/24 are distinguishable in the legend, not just on the plot.
+function chipEl(runId) {
+  const color = runColor(runId);
+  const dash = runDash(runId);
+  if (!dash) {
+    const c = el("span", "chip");
+    c.style.background = color;
+    return c;
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 10");
+  svg.classList.add("chip", "chip-line");
+  const line = document.createElementNS(NS, "line");
+  line.setAttribute("x1", "0"); line.setAttribute("x2", "16");
+  line.setAttribute("y1", "5"); line.setAttribute("y2", "5");
+  line.setAttribute("stroke", color);
+  line.setAttribute("stroke-width", "3");
+  line.setAttribute("stroke-dasharray", dash.map((v) => Math.max(1, Math.round(v / 2))).join(" "));
+  svg.appendChild(line);
+  return svg;
+}
 function runName(runId) { return state.aliases[runId] || runId; }
 
 function hexToRgba(hex, a) {
@@ -184,8 +217,39 @@ async function fetchRuns(force) {
   runs = d.runs;
   runIndex = new Map(runs.map((r) => [r.id, r]));
   serverClockSkew = d.now - Date.now() / 1000;
+  migrateSelectedIds();
   $("scan-status").textContent = d.scanning ? "scanning…" : `${runs.length}`;
   renderSidebar();
+}
+
+// A run's chosen id can migrate between scans (a shallower symlink appears,
+// or a resume alias was selected in an older session). Remap selected ids
+// that are now aliases onto the chosen id, carrying slot + rename along —
+// otherwise the runIndex filter drops them before the server ever sees them.
+function migrateSelectedIds() {
+  const aliasToChosen = new Map();
+  for (const r of runs) for (const a of (r.aliases || [])) aliasToChosen.set(a, r.id);
+  let changed = false;
+  state.selected = state.selected.map((rid) => {
+    if (runIndex.has(rid)) return rid;
+    const chosen = aliasToChosen.get(rid);
+    if (!chosen) return rid; // genuinely gone: keep, rendered dimmed
+    changed = true;
+    if (rid in state.slots) {
+      if (!(chosen in state.slots)) state.slots[chosen] = state.slots[rid];
+      delete state.slots[rid];
+    }
+    if (state.aliases[rid] && !state.aliases[chosen]) {
+      state.aliases[chosen] = state.aliases[rid];
+      delete state.aliases[rid];
+    }
+    return chosen;
+  });
+  if (!changed) return;
+  const seen = new Set();
+  state.selected = state.selected.filter((rid) => !seen.has(rid) && seen.add(rid));
+  saveState();
+  onSelectionChange();
 }
 
 async function fetchTags(force) {
@@ -229,6 +293,17 @@ async function flushFetch() {
     console.error(e);
     return;
   }
+  // the slider may have moved while this batch was in flight: a response
+  // computed with a stale alpha must be dropped, not displayed, and the
+  // affected charts re-requested under the current alpha
+  const curSmoothing = state.smoothing > 0 ? state.smoothing : 0;
+  if (smoothing !== curSmoothing) {
+    for (const s of series) {
+      const chart = charts.get(s.tag);
+      if (chart && chart.visible) chart.ensureData();
+    }
+    return;
+  }
   for (const [rid, v] of Object.entries(d.versions || {})) runVersions.set(rid, v);
   const touched = new Set();
   for (const s of d.series || []) {
@@ -263,11 +338,7 @@ function renderSelectedList() {
   for (const rid of state.selected) {
     const info = runIndex.get(rid);
     const row = el("div", "run-row");
-    const chip = el("span", "chip" + (runDashed(rid) ? " dashed" : ""));
-    chip.style.setProperty("--chip-color", runColor(rid));
-    chip.style.background = runDashed(rid) ? "" : runColor(rid);
-    if (runDashed(rid)) chip.style.setProperty("background-color", runColor(rid));
-    row.appendChild(chip);
+    row.appendChild(chipEl(rid));
     const name = el("span", "name");
     name.textContent = runName(rid);
     name.title = rid + (info ? "\n" + info.path : " (not found in current scan)");
@@ -341,12 +412,7 @@ function renderRunList() {
     cb.checked = selSet.has(r.id);
     cb.onclick = (e) => { e.stopPropagation(); toggleRun(r.id); };
     row.appendChild(cb);
-    if (selSet.has(r.id)) {
-      const chip = el("span", "chip" + (runDashed(r.id) ? " dashed" : ""));
-      chip.style.setProperty("--chip-color", runColor(r.id));
-      if (!runDashed(r.id)) chip.style.background = runColor(r.id);
-      row.appendChild(chip);
-    }
+    if (selSet.has(r.id)) row.appendChild(chipEl(r.id));
     const name = el("span", "name");
     if (state.aliases[r.id]) {
       name.appendChild(el("span", "", state.aliases[r.id] + " "));
@@ -708,11 +774,7 @@ function renderTooltip(chart, u) {
   tooltipEl.appendChild(el("div", "tt-x", fmtX(xv)));
   for (const r of rows.slice(0, 14)) {
     const row = el("div", "tt-row" + (r === nearest ? " near" : ""));
-    const chip = el("span", "chip");
-    chip.style.background = runColor(r.run);
-    if (runDashed(r.run)) chip.style.background =
-      `repeating-linear-gradient(45deg, ${runColor(r.run)} 0 2px, transparent 2px 4px)`;
-    row.appendChild(chip);
+    row.appendChild(chipEl(r.run));
     row.appendChild(el("span", "nm", runName(r.run)));
     if (r.x !== xv) row.appendChild(el("span", "at", "@ " + fmtX(r.x)));
     row.appendChild(el("span", "val", fmtVal(r.v)));
@@ -818,7 +880,9 @@ function rebuildStructure() {
   pinGrid.textContent = "";
   $("pinned-section").classList.toggle("hidden", pinned.length === 0);
   let budget = MAX_CARDS;
+  let truncated = 0;
   for (const tag of pinned) {
+    if (budget <= 0) { truncated += 1; continue; } // pins honor the cap too
     const c = getChart(tag);
     c.setPinned(true);
     pinGrid.appendChild(c.el);
@@ -836,7 +900,6 @@ function rebuildStructure() {
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(tag);
   }
-  let truncated = 0;
   for (const [g, tags] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const sec = el("section", "group" + (state.collapsed[g] ? " collapsed" : ""));
     const head = el("div", "section-head");
@@ -1077,6 +1140,7 @@ async function init() {
 init();
 
 // debugging/testing handle
-window.__rb = { state, charts: () => charts, runs: () => runs };
+window.__rb = { state, charts: () => charts, runs: () => runs,
+                rebuild: rebuildStructure, renderSidebar };
 
 })();

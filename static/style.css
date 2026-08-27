@@ -157,10 +157,12 @@ button:hover { background: var(--hover); color: var(--ink); }
   border-radius: 3px;
   flex: none;
 }
-.run-row .chip.dashed {
-  background:
-    repeating-linear-gradient(45deg, transparent 0 2px, var(--surface) 2px 4px),
-    var(--chip-color, var(--muted));
+.chip-line {
+  width: 16px !important;
+  height: 10px !important;
+  border-radius: 0 !important;
+  background: none !important;
+  flex: none;
 }
 .run-row .name {
   flex: 1;
