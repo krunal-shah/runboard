@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+<link rel="stylesheet" href="/static/uplot.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="topbar">
+  <div id="brand">run<b>board</b></div>
+  <input id="tag-filter" type="search" placeholder="filter tags…  (text or /regex/)" spellcheck="false">
+  <div class="tb-group" title="Exponential moving average smoothing (TB-style, debiased)">
+    <label for="smoothing">smooth</label>
+    <input id="smoothing" type="range" min="0" max="0.99" step="0.01" value="0">
+    <span id="smoothing-val">0</span>
+  </div>
+  <div class="tb-group">
+    <label for="xmode">x</label>
+    <select id="xmode">
+      <option value="step">step</option>
+      <option value="rel">rel. hours</option>
+      <option value="wall">wall clock</option>
+    </select>
+  </div>
+  <div class="tb-group">
+    <label for="chart-size">size</label>
+    <select id="chart-size">
+      <option value="s">S</option>
+      <option value="m" selected>M</option>
+      <option value="l">L</option>
+    </select>
+  </div>
+  <button id="link-zoom" class="toggle-btn" title="Drag-zoom on one chart zooms all charts">link zoom</button>
+  <button id="auto-refresh" class="toggle-btn" title="Poll for new data every 30s">auto ⟳</button>
+  <button id="refresh-now" title="Refresh run list and data now">⟳</button>
+  <button id="theme-btn" title="Theme: system → light → dark">◐</button>
+  <button id="export-state" title="Download UI state (selection, aliases, pins) as JSON">⤓</button>
+  <button id="import-state" title="Load UI state from JSON">⤒</button>
+  <input id="import-file" type="file" accept="application/json" hidden>
+</div>
+
+<div id="layout">
+  <aside id="sidebar">
+    <input id="run-search" type="search" placeholder="search runs…  (words or /regex/)" spellcheck="false">
+    <div id="run-actions">
+      <button id="select-visible" title="Select all runs matching the search">+ visible</button>
+      <button id="clear-selection" title="Deselect all runs">clear</button>
+      <span id="run-count"></span>
+    </div>
+    <div id="selected-section">
+      <div class="side-head">selected <span id="selected-count"></span></div>
+      <div id="selected-list"></div>
+    </div>
+    <div class="side-head">runs <span id="scan-status"></span></div>
+    <div id="run-list"></div>
+  </aside>
+
+  <main id="main">
+    <section id="pinned-section" class="hidden">
+      <div class="section-head pinned-head">📌 pinned <span class="hint">drag cards to reorder</span></div>
+      <div id="pinned-grid" class="chart-grid"></div>
+    </section>
+    <div id="groups"></div>
+    <div id="empty-hint">select runs on the left to see charts</div>
+  </main>
+</div>
+
+<div id="tooltip" class="hidden"></div>
+
+<script src="/static/uplot.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
