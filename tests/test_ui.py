@@ -301,6 +301,105 @@ async def flow_persisted_state(browser, url):
     await page2.close()
 
 
+async def flow_state_io(browser, url):
+    """Import must survive its own reload; malformed state must not brick init."""
+    errors = []
+
+    # import round-trip: the file's state must be live after the auto-reload
+    page = await browser.new_page(viewport={"width": 1400, "height": 900})
+    page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+    await page.goto(url, wait_until="networkidle")
+    await page.wait_for_selector("#run-list .run-row", timeout=15000)
+    imp = {"selected": ["run-00"], "slots": {"run-00": 0},
+           "aliases": {"run-00": "imported-name"}, "smoothing": 0.5}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(imp, f)
+    try:
+        await page.set_input_files("#import-file", path)
+        await page.wait_for_timeout(2500)  # handler saves synchronously + reloads
+        await page.wait_for_selector("#run-list .run-row", timeout=15000)
+        got = await page.evaluate(
+            "({sel: window.__rb.state.selected, al: window.__rb.state.aliases['run-00'],"
+            "  sm: window.__rb.state.smoothing,"
+            "  ls: localStorage.getItem('runboard:v1') !== null})")
+        check("import survives its own reload",
+              got["sel"] == ["run-00"] and got["al"] == "imported-name"
+              and got["sm"] == 0.5 and got["ls"], str(got))
+    finally:
+        os.unlink(path)
+    await page.close()
+
+    # malformed persisted state: nulls/bad types must fall back to defaults
+    page2 = await browser.new_page(viewport={"width": 1400, "height": 900})
+    page2.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+    bad = {"selected": [f"r{i}" for i in range(31)] + [42],
+           "slots": None, "smoothing": "bogus", "pins": {"not": "an array"},
+           "aliases": {"x": 7}, "xmode": "nope"}
+    await page2.add_init_script(
+        f"localStorage.setItem('runboard:v1', JSON.stringify({json.dumps(bad)}))")
+    await page2.goto(url, wait_until="networkidle")
+    await page2.wait_for_selector("#run-list .run-row", timeout=15000)
+    got2 = await page2.evaluate(
+        "({n: window.__rb.state.selected.length, sm: window.__rb.state.smoothing,"
+        "  pins: Array.isArray(window.__rb.state.pins),"
+        "  slots: typeof window.__rb.state.slots,"
+        "  xmode: window.__rb.state.xmode,"
+        "  rows: document.querySelectorAll('#run-list .run-row').length})")
+    check("malformed state falls back to defaults and still initializes",
+          got2["n"] == 30 and got2["sm"] == 0 and got2["pins"]
+          and got2["slots"] == "object" and got2["xmode"] == "step"
+          and got2["rows"] > 0, str(got2))
+    check("no page errors (state io)", not errors, str(errors[:3]))
+    await page2.close()
+
+
+async def flow_out_of_order(browser, url, root):
+    """A held-up scalars response (same alpha, older version) landing after a
+    fresher one must not regress the displayed data."""
+    errors = []
+    page = await browser.new_page(viewport={"width": 1400, "height": 900})
+    page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+
+    held = {"n": 0}
+    async def route_scalars(route):
+        held["n"] += 1
+        if held["n"] == 1:
+            # fetch NOW (server still at version 1), deliver LATE
+            resp = await route.fetch()
+            body = await resp.text()
+            await asyncio.sleep(2.5)
+            await route.fulfill(response=resp, body=body)
+        else:
+            await route.continue_()
+    await page.route("**/api/scalars", route_scalars)
+
+    await page.goto(url, wait_until="networkidle")
+    await page.wait_for_selector("#run-list .run-row", timeout=15000)
+    await select_run(page, "run-00")
+    await page.wait_for_timeout(700)  # batch #1 fetched (v1) and now held
+
+    # new data lands on disk -> version 2 exists server-side
+    from torch.utils.tensorboard import SummaryWriter
+    w = SummaryWriter(os.path.join(root, "run-00"), flush_secs=1000)
+    w.add_scalar("loss", 12345.0, 100)
+    w.close()
+    await page.click("#refresh-now")  # batch #2, forced, returns v2 fast
+    await page.wait_for_timeout(4000)  # held v1 response lands last
+
+    got = await page.evaluate("""
+      (() => {
+        const c = window.__rb.charts().get('loss');
+        const d = c && c.data.get('run-00');
+        return d ? {version: d.version, hasNew: d.step.includes(100)} : null;
+      })()
+    """)
+    check("late same-alpha response does not regress data",
+          got and got["version"] >= 2 and got["hasNew"], str(got))
+    check("no page errors (out of order)", not errors, str(errors[:3]))
+    await page.close()
+
+
 async def main():
     root = tempfile.mkdtemp(prefix="runboard-test-")
     try:
@@ -311,6 +410,8 @@ async def main():
                 await flow_basics(browser, url)
                 await flow_tooltip_and_smoothing(browser, url)
                 await flow_persisted_state(browser, url)
+                await flow_state_io(browser, url)
+                await flow_out_of_order(browser, url, root)  # mutates run-00; keep last
                 await browser.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -70,25 +70,65 @@ const el = (tag, cls, text) => {
   return e;
 };
 
+function saveStateNow() {
+  clearTimeout(saveState._t);
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) {}
+}
 function saveState() {
   clearTimeout(saveState._t);
-  saveState._t = setTimeout(() => {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) {}
-  }, 250);
+  saveState._t = setTimeout(saveStateNow, 250);
 }
-function loadState() {
-  try {
-    const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
-    for (const k of Object.keys(state)) if (k in s) state[k] = s[k];
-  } catch (e) {}
-  // persisted/imported state must honor the same cap as interactive
-  // selection — the server truncates at 64 and 65+ would silently drop runs
-  if (!Array.isArray(state.selected)) state.selected = [];
+// a pending debounced write must not be lost to navigation/close
+window.addEventListener("beforeunload", saveStateNow);
+
+// Every externally-sourced state blob (localStorage or an imported file)
+// passes through the same validators — a malformed field falls back to the
+// default instead of breaking init, and content is pruned per-entry.
+const isPlainObj = (v) => v != null && typeof v === "object" && !Array.isArray(v);
+const STATE_VALIDATORS = {
+  theme: (v) => ["system", "light", "dark"].includes(v),
+  selected: Array.isArray,
+  slots: isPlainObj,
+  aliases: isPlainObj,
+  pins: Array.isArray,
+  collapsed: isPlainObj,
+  logTags: isPlainObj,
+  smoothing: (v) => typeof v === "number" && isFinite(v) && v >= 0 && v < 1,
+  xmode: (v) => ["step", "rel", "wall"].includes(v),
+  chartSize: (v) => ["s", "m", "l"].includes(v),
+  linkZoom: (v) => typeof v === "boolean",
+  autoRefresh: (v) => typeof v === "boolean",
+};
+
+function applyState(s) {
+  if (!isPlainObj(s)) return false;
+  for (const k of Object.keys(state)) {
+    if (k in s && STATE_VALIDATORS[k] && STATE_VALIDATORS[k](s[k])) state[k] = s[k];
+  }
+  state.selected = state.selected.filter((x) => typeof x === "string");
+  state.pins = state.pins.filter((x) => typeof x === "string");
+  for (const [k, v] of Object.entries(state.slots)) {
+    if (typeof v !== "number" || !isFinite(v) || v < 0) delete state.slots[k];
+  }
+  for (const [k, v] of Object.entries(state.aliases)) {
+    if (typeof v !== "string" || !v) delete state.aliases[k];
+  }
+  for (const obj of [state.collapsed, state.logTags]) {
+    for (const [k, v] of Object.entries(obj)) if (v !== true) delete obj[k];
+  }
+  // persisted/imported state honors the same cap as interactive selection —
+  // the server truncates at 64 and 65+ would silently drop runs
   if (state.selected.length > MAX_SELECTED) {
     for (const rid of state.selected.slice(MAX_SELECTED)) delete state.slots[rid];
     state.selected = state.selected.slice(0, MAX_SELECTED);
-    saveState();
   }
+  return true;
+}
+
+function loadState() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) {}
+  applyState(s);
 }
 
 function effTheme() {
@@ -304,11 +344,18 @@ async function flushFetch() {
     }
     return;
   }
-  for (const [rid, v] of Object.entries(d.versions || {})) runVersions.set(rid, v);
+  // responses can arrive out of order (a held-up batch landing after a
+  // fresher one) — version bookkeeping and cached data must never regress
+  for (const [rid, v] of Object.entries(d.versions || {})) {
+    const cur = runVersions.get(rid);
+    if (cur == null || v > cur) runVersions.set(rid, v);
+  }
   const touched = new Set();
   for (const s of d.series || []) {
     const chart = charts.get(s.tag);
     if (!chart) continue;
+    const prev = chart.data.get(s.run);
+    if (prev && prev.smoothing === smoothing && prev.version >= s.version) continue;
     chart.data.set(s.run, s.empty
       ? { empty: true, version: s.version, smoothing }
       : { step: s.step, wall: s.wall, value: s.value, smooth: s.smooth,
@@ -1114,10 +1161,10 @@ function bindControls() {
     if (!f) return;
     try {
       const s = JSON.parse(await f.text());
-      for (const k of Object.keys(state)) if (k in s) state[k] = s[k];
-      saveState();
+      if (!applyState(s)) throw new Error("not a runboard state object");
+      saveStateNow(); // synchronous — the debounced write would be lost to the reload
       location.reload();
-    } catch (err) { alert("Could not parse state file: " + err); }
+    } catch (err) { alert("Could not import state file: " + err); }
   };
 
   window.addEventListener("resize", () => {
