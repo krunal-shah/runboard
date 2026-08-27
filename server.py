@@ -47,7 +47,8 @@ class Scanner:
         self.max_depth = max_depth
         self.interval = interval
         self.lock = threading.Lock()
-        self.runs = {}          # id -> {id, path, mtime, size, nfiles}
+        self.runs = {}          # id -> {id, path, mtime, size, nfiles, aliases}
+        self.alias_index = {}   # alias id -> chosen id
         self.scanned_at = 0.0
         self.scanning = False
         self._wake = threading.Event()
@@ -71,36 +72,43 @@ class Scanner:
     def _scan(self):
         self.scanning = True
         t0 = time.time()
-        found = {}   # realpath -> (id, info)
+        found = {}      # realpath -> best (shallowest/shortest id) info
+        alias_ids = {}  # realpath -> every id that reaches this run
         visited = set()
+
+        def register(real: str, rel: str, entries):
+            ev_files = [e for e in entries
+                        if e.is_file(follow_symlinks=True) and ".tfevents." in e.name]
+            if not ev_files:
+                return
+            size = mtime = 0
+            for e in ev_files:
+                try:
+                    st = e.stat(follow_symlinks=True)
+                    size += st.st_size
+                    mtime = max(mtime, st.st_mtime)
+                except OSError:
+                    pass
+            rid = rel if rel else "(root)"
+            alias_ids.setdefault(real, set()).add(rid)
+            prev = found.get(real)
+            # prefer fewer path components, then shorter name
+            if prev is None or (rid.count("/"), len(rid)) < (prev["id"].count("/"), len(prev["id"])):
+                found[real] = {"id": rid, "path": real, "mtime": mtime,
+                               "size": size, "nfiles": len(ev_files)}
 
         def walk(dirpath: str, rel: str, depth: int):
             try:
                 real = os.path.realpath(dirpath)
-                if real in visited:
-                    return
-                visited.add(real)
                 entries = list(os.scandir(dirpath))
             except OSError:
                 return
-            ev_files = [e for e in entries
-                        if e.is_file(follow_symlinks=True) and ".tfevents." in e.name]
-            if ev_files:
-                size = mtime = 0
-                for e in ev_files:
-                    try:
-                        st = e.stat(follow_symlinks=True)
-                        size += st.st_size
-                        mtime = max(mtime, st.st_mtime)
-                    except OSError:
-                        pass
-                rid = rel if rel else "(root)"
-                info = {"id": rid, "path": real, "mtime": mtime,
-                        "size": size, "nfiles": len(ev_files)}
-                prev = found.get(real)
-                # prefer fewer path components, then shorter name
-                if prev is None or (rid.count("/"), len(rid)) < (prev["id"].count("/"), len(prev["id"])):
-                    found[real] = info
+            # every alias registers (id preference + searchability), but a
+            # realpath's children are walked only once (cycle protection)
+            register(real, rel, entries)
+            if real in visited:
+                return
+            visited.add(real)
             if depth >= self.max_depth:
                 return
             for e in entries:
@@ -113,12 +121,19 @@ class Scanner:
                     continue
 
         walk(self.root, "", 0)
-        runs = {info["id"]: info for info in found.values()}
+        runs = {}
+        alias_index = {}
+        for real, info in found.items():
+            info["aliases"] = sorted(alias_ids[real] - {info["id"]})
+            runs[info["id"]] = info
+            for a in info["aliases"]:
+                alias_index[a] = info["id"]
         with self.lock:
             self.runs = runs
+            self.alias_index = alias_index
             self.scanned_at = time.time()
             self.scanning = False
-        print(f"[scanner] {len(runs)} runs in {time.time()-t0:.1f}s")
+        print(f"[scanner] {len(runs)} runs in {time.time()-t0:.1f}s", flush=True)
 
     def snapshot(self):
         with self.lock:
@@ -126,7 +141,14 @@ class Scanner:
 
     def resolve(self, run_id: str):
         with self.lock:
-            return self.runs.get(run_id)
+            info = self.runs.get(run_id)
+            if info is None:
+                # ids can migrate when a shallower symlink appears; keep old
+                # selections working via the alias index
+                chosen = getattr(self, "alias_index", {}).get(run_id)
+                if chosen is not None:
+                    info = self.runs.get(chosen)
+            return info
 
 
 # ---------------------------------------------------------------- parsing
@@ -170,20 +192,30 @@ class RunData:
                 names = sorted(n for n in os.listdir(self.dir) if ".tfevents." in n)
             except OSError:
                 return
-            changed = False
+            stats = {}
             for name in names:
                 path = os.path.join(self.dir, name)
                 try:
-                    st = os.stat(path)
+                    stats[path] = os.stat(path)
                 except OSError:
                     continue
+            # a replaced/truncated/deleted file invalidates points already
+            # parsed from it, and points are not attributed per-file — so any
+            # such change means a full reparse of the run
+            reset = any(p not in stats for p in self.files)
+            for path, st in stats.items():
+                fs = self.files.get(path)
+                if fs is not None and (st.st_ino != fs.ino or st.st_size < fs.offset):
+                    reset = True
+            if reset:
+                self.files = {}
+                self.tags = {}
+                self.points = 0
+            changed = reset
+            for path, st in stats.items():
                 fs = self.files.get(path)
                 if fs is None:
                     fs = self.files[path] = _FileState()
-                    fs.ino = st.st_ino
-                if st.st_ino != fs.ino or st.st_size < fs.offset:
-                    # replaced or truncated: reparse from scratch
-                    fs.offset = 0
                     fs.ino = st.st_ino
                 if st.st_size > fs.offset:
                     changed |= self._parse_tail(path, fs)
@@ -305,13 +337,15 @@ class Store:
                 rd.drop()
 
 
-# ---------------------------------------------------------------- downsample
+# ---------------------------------------------------------------- transforms
 
-def downsample(steps, walls, vals, target: int):
-    """Min/max-preserving decimation: spikes survive."""
-    n = len(steps)
+def downsample_idx(vals, target: int):
+    """Indices for min/max-preserving decimation (spikes survive), or None
+    to keep every point. Same indices are applied to raw and smoothed
+    columns so they stay aligned."""
+    n = len(vals)
     if n <= target:
-        return steps, walls, vals
+        return None
     nb = max(1, target // 2)
     bounds = np.linspace(0, n, nb + 1).astype(np.int64)
     sel = {0, n - 1}
@@ -325,8 +359,30 @@ def downsample(steps, walls, vals, target: int):
             continue
         sel.add(a + int(np.nanargmin(seg)))
         sel.add(a + int(np.nanargmax(seg)))
-    idx = np.fromiter(sorted(sel), dtype=np.int64)
-    return steps[idx], walls[idx], vals[idx]
+    return np.fromiter(sorted(sel), dtype=np.int64)
+
+
+def ema_debiased(vals, alpha: float):
+    """TB-style debiased EMA over the FULL-resolution series (smoothing must
+    happen before downsampling or its strength depends on decimation).
+    Non-finite values pass through untouched and don't advance the state."""
+    out = np.full(len(vals), np.nan)
+    m = np.isfinite(vals)
+    v = vals[m]
+    if len(v) == 0:
+        return out
+    try:
+        from scipy.signal import lfilter
+        s = lfilter([1.0 - alpha], [1.0, -alpha], v)
+    except ImportError:
+        s = np.empty(len(v))
+        acc = 0.0
+        for i in range(len(v)):
+            acc = alpha * acc + (1.0 - alpha) * v[i]
+            s[i] = acc
+    debias = 1.0 - np.power(alpha, np.arange(1, len(v) + 1))
+    out[m] = s / debias
+    return out
 
 
 def _jsonable_vals(vals):
@@ -362,6 +418,7 @@ def api_runs(refresh: int = 0):
 @app.post("/api/tags")
 def api_tags(body: dict):
     run_ids = body.get("runs", [])[:64]
+    force = bool(body.get("force"))
     out = {}
     for rid in run_ids:
         info = scanner.resolve(rid)
@@ -369,7 +426,7 @@ def api_tags(body: dict):
             out[rid] = {"error": "unknown run", "version": 0, "tags": []}
             continue
         rd = store.get(info["path"])
-        rd.refresh()
+        rd.refresh(force=force)
         out[rid] = {"version": rd.version,
                     "tags": [[t, c] for t, c in sorted(rd.tag_list())]}
     return {"runs": out}
@@ -379,6 +436,10 @@ def api_tags(body: dict):
 def api_scalars(body: dict):
     reqs = body.get("series", [])[:512]
     points = min(int(body.get("points", 1200)), 8000)
+    force = bool(body.get("force"))
+    smoothing = float(body.get("smoothing") or 0.0)
+    if not (0.0 < smoothing < 1.0):
+        smoothing = 0.0
     out = []
     versions = {}
     for req in reqs:
@@ -387,7 +448,7 @@ def api_scalars(body: dict):
         if info is None or tag is None:
             continue
         rd = store.get(info["path"])
-        rd.refresh()
+        rd.refresh(force=force)
         versions[rid] = rd.version
         if req.get("version") == rd.version:
             continue  # client already has current data for this run
@@ -395,14 +456,23 @@ def api_scalars(body: dict):
         if tri is None:
             out.append({"run": rid, "tag": tag, "version": rd.version, "empty": True})
             continue
-        steps, walls, vals = downsample(*tri, points)
-        out.append({
+        steps, walls, vals = tri
+        smooth = ema_debiased(vals, smoothing) if smoothing else None
+        idx = downsample_idx(vals, points)
+        if idx is not None:
+            steps, walls, vals = steps[idx], walls[idx], vals[idx]
+            if smooth is not None:
+                smooth = smooth[idx]
+        entry = {
             "run": rid, "tag": tag, "version": rd.version,
             "step": steps.tolist(),
             "wall": [round(w, 3) for w in walls.tolist()],
             "value": _jsonable_vals(vals),
             "n": len(tri[0]),
-        })
+        }
+        if smooth is not None:
+            entry["smooth"] = _jsonable_vals(smooth)
+        out.append(entry)
     return {"series": out, "versions": versions}
 
 

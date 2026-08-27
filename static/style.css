@@ -310,6 +310,8 @@ button:hover { background: var(--hover); color: var(--ink); }
 }
 #tooltip .tt-row.near .nm { color: var(--ink); }
 #tooltip .tt-row .val { margin-left: auto; font-variant-numeric: tabular-nums; }
+#tooltip .tt-row .at { color: var(--muted); font-size: 11px; margin-left: 4px; }
+#tooltip .tt-row .at + .val { margin-left: 10px; }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--baseline); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }

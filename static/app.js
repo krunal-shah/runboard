@@ -23,7 +23,10 @@ const LS_KEY = "runboard:v1";
 const REFRESH_MS = 30_000;
 const MAX_CARDS = 400;
 const MAX_LIST_ROWS = 600;
-const MAX_SELECT_VISIBLE = 30;
+// hard cap on selected runs: 8 palette slots x 4 line patterns stays
+// distinguishable; also keeps every selection under the server's 64-run cap
+const MAX_SELECTED = 30;
+const DASH_CYCLES = [null, [6, 6], [2, 4], [12, 3, 3, 3]];
 const LIVE_WINDOW_S = 15 * 60;
 const CHART_H = { s: 170, m: 240, l: 340 };
 const CARD_MIN = { s: 330, m: 430, l: 580 };
@@ -88,7 +91,10 @@ function runColor(runId) {
   const slot = state.slots[runId] ?? 0;
   return PALETTE[effTheme()][slot % 8];
 }
-function runDashed(runId) { return (state.slots[runId] ?? 0) >= 8; }
+function runDash(runId) {
+  return DASH_CYCLES[Math.floor((state.slots[runId] ?? 0) / 8) % DASH_CYCLES.length];
+}
+function runDashed(runId) { return runDash(runId) != null; }
 function runName(runId) { return state.aliases[runId] || runId; }
 
 function hexToRgba(hex, a) {
@@ -133,20 +139,6 @@ function fmtAgo(sec) {
   return Math.round(sec / 86400) + "d";
 }
 
-// TB-style debiased EMA.
-function ema(vals, a) {
-  const out = new Array(vals.length);
-  let s = 0, n = 0;
-  for (let i = 0; i < vals.length; i++) {
-    const v = vals[i];
-    if (v == null || !isFinite(v)) { out[i] = null; continue; }
-    s = a * s + (1 - a) * v;
-    n++;
-    out[i] = s / (1 - Math.pow(a, n));
-  }
-  return out;
-}
-
 // ------------------------------------------------------------------ slots
 
 function assignSlot(runId) {
@@ -163,6 +155,11 @@ function toggleRun(runId) {
     state.selected.splice(i, 1);
     delete state.slots[runId];
   } else {
+    if (state.selected.length >= MAX_SELECTED) {
+      alert(`Selection cap is ${MAX_SELECTED} runs — deselect something first.`);
+      renderSidebar(); // undo the checkbox tick
+      return;
+    }
     state.selected.push(runId);
     assignSlot(runId);
   }
@@ -191,13 +188,13 @@ async function fetchRuns(force) {
   renderSidebar();
 }
 
-async function fetchTags() {
+async function fetchTags(force) {
   const sel = state.selected.filter((r) => runIndex.has(r));
   const seq = ++tagsFetchSeq;
   if (!sel.length) { tagsByRun = new Map(); rebuildStructure(); return; }
   $("scan-status").textContent = "loading tags…";
   try {
-    const d = await api("/api/tags", { runs: sel });
+    const d = await api("/api/tags", { runs: sel, force: !!force });
     if (seq !== tagsFetchSeq) return; // superseded by a newer selection
     for (const [rid, info] of Object.entries(d.runs)) {
       tagsByRun.set(rid, new Set((info.tags || []).map((t) => t[0])));
@@ -212,6 +209,7 @@ async function fetchTags() {
 
 // Batched scalar fetching with a short debounce.
 const pendingFetch = new Map(); // "run\x00tag" -> {run, tag, version?}
+let forceNextFetch = false;     // set by "refresh now" to bypass the stat throttle
 function enqueueFetch(run, tag, version) {
   pendingFetch.set(run + "\x00" + tag, { run, tag, version });
   clearTimeout(enqueueFetch._t);
@@ -221,9 +219,12 @@ async function flushFetch() {
   if (!pendingFetch.size) return;
   const series = [...pendingFetch.values()].slice(0, 512);
   for (const s of series) pendingFetch.delete(s.run + "\x00" + s.tag);
+  const smoothing = state.smoothing > 0 ? state.smoothing : 0;
+  const force = forceNextFetch;
+  forceNextFetch = false;
   let d;
   try {
-    d = await api("/api/scalars", { series, points: FETCH_POINTS });
+    d = await api("/api/scalars", { series, points: FETCH_POINTS, smoothing, force });
   } catch (e) {
     console.error(e);
     return;
@@ -234,8 +235,9 @@ async function flushFetch() {
     const chart = charts.get(s.tag);
     if (!chart) continue;
     chart.data.set(s.run, s.empty
-      ? { empty: true, version: s.version }
-      : { step: s.step, wall: s.wall, value: s.value, version: s.version, n: s.n });
+      ? { empty: true, version: s.version, smoothing }
+      : { step: s.step, wall: s.wall, value: s.value, smooth: s.smooth,
+          version: s.version, n: s.n, smoothing });
     touched.add(chart);
   }
   // series the server skipped (already current) still clear the loading state
@@ -318,11 +320,17 @@ function startRename(row, nameEl, rid) {
   inp.onclick = (e) => e.stopPropagation();
 }
 
+function matchesRun(match, r) {
+  // searchable surface: chosen id, client alias, and every symlink alias the
+  // scanner found (e.g. a resume job id pointing at the same run dir)
+  return match(r.id) || match(runName(r.id)) || (r.aliases || []).some(match);
+}
+
 function renderRunList() {
   const box = $("run-list");
   box.textContent = "";
   const match = matcher(runSearch);
-  const shown = runs.filter((r) => match(runName(r.id)) || match(r.id));
+  const shown = runs.filter((r) => matchesRun(match, r));
   $("run-count").textContent = `${shown.length}/${runs.length}`;
   const now = Date.now() / 1000 + serverClockSkew;
   const selSet = new Set(state.selected);
@@ -346,7 +354,8 @@ function renderRunList() {
     } else {
       name.textContent = r.id;
     }
-    name.title = r.id + "\n" + r.path;
+    name.title = r.id + "\n" + r.path +
+      ((r.aliases || []).length ? "\nalso: " + r.aliases.join("\n      ") : "");
     row.appendChild(name);
     if (now - r.mtime < LIVE_WINDOW_S) row.appendChild(liveDot());
     const ren = el("button", "icon-btn", "✎");
@@ -438,13 +447,19 @@ class ChartCard {
   wanted() {
     // (run, version) pairs this chart needs fetched
     const out = [];
+    const sm = state.smoothing > 0 ? state.smoothing : 0;
     for (const rid of state.selected) {
       const tags = tagsByRun.get(rid);
       if (!tags || !tags.has(this.tag)) continue;
       const d = this.data.get(rid);
       const cur = runVersions.get(rid);
-      if (!d || (cur != null && d.version !== cur)) {
-        out.push({ run: rid, version: d ? d.version : undefined });
+      const versionStale = !d || (cur != null && d.version !== cur);
+      // smoothing is computed server-side over full-resolution data, so
+      // cached entries built with a different alpha must be refetched —
+      // without a version (a matching version would make the server skip)
+      const smoothStale = d && sm > 0 && d.smoothing !== sm;
+      if (versionStale || smoothStale) {
+        out.push({ run: rid, version: smoothStale ? undefined : (d ? d.version : undefined) });
       }
     }
     return out;
@@ -470,7 +485,7 @@ class ChartCard {
         const w0 = d.wall[0];
         xs = d.wall.map((w) => (w - w0) / 3600);
       }
-      perRun.push({ rid, xs, ys: d.value });
+      perRun.push({ rid, xs, ys: d.value, smooth: d.smooth });
     }
     if (!perRun.length) return null;
 
@@ -492,14 +507,12 @@ class ChartCard {
         if (v != null && log && v <= 0) v = null;
         raw[xpos.get(s.xs[i])] = v;
       }
-      if (sm > 0) {
-        // smooth over the run's own points, then scatter into the union grid
-        const own = [];
-        for (let i = 0; i < s.xs.length; i++) own.push(s.ys[i]);
-        const smoothed = ema(own, sm);
+      // smoothed values come from the server (computed pre-downsampling);
+      // until the refetch for a new alpha lands, render raw only
+      if (sm > 0 && s.smooth) {
         const smCol = new Array(xu.length).fill(null);
         for (let i = 0; i < s.xs.length; i++) {
-          let v = smoothed[i];
+          let v = s.smooth[i];
           if (v != null && log && v <= 0) v = null;
           smCol[xpos.get(s.xs[i])] = v;
         }
@@ -523,17 +536,23 @@ class ChartCard {
     this.loadingEl.classList.add("hidden");
     const key = JSON.stringify([built.meta, state.xmode, state.smoothing > 0 ? state.smoothing : 0,
       !!state.logTags[this.tag], effTheme(), state.chartSize,
-      built.meta.map((m) => [runColor(m.run), runDashed(m.run)])]);
+      built.meta.map((m) => [runColor(m.run), runDash(m.run)])]);
     if (this.u && key === this.seriesKey && !force) {
       this.u.setData(built.data, !this.zoomed);
       return;
     }
     this.seriesKey = key;
     this.seriesMeta = built.meta;
+    let savedCursor = null;
     if (this.u) {
       if (this.zoomed) {
         const sx = this.u.scales.x;
         this.savedXRange = [sx.min, sx.max];
+      }
+      // a recreate under the pointer (e.g. data landing mid-hover) would
+      // otherwise kill the crosshair until the mouse moves again
+      if (hoveredChart === this && this.u.cursor.left >= 0) {
+        savedCursor = { left: this.u.cursor.left, top: this.u.cursor.top };
       }
       this.u.destroy();
       this.u = null;
@@ -544,6 +563,7 @@ class ChartCard {
     if (this.zoomed && this.savedXRange) {
       this.u.setScale("x", { min: this.savedXRange[0], max: this.savedXRange[1] });
     }
+    if (savedCursor) this.u.setCursor(savedCursor);
   }
 
   opts(meta, width, height) {
@@ -554,16 +574,16 @@ class ChartCard {
     const series = [{}];
     for (const m of meta) {
       const color = runColor(m.run);
-      const dashed = runDashed(m.run);
+      const dash = runDash(m.run) || undefined;
       if (m.kind === "raw") {
         series.push({
           stroke: hexToRgba(color, 0.25), width: 1.25, spanGaps: true,
-          dash: dashed ? [6, 6] : undefined, points: { show: false },
+          dash, points: { show: false },
         });
       } else {
         series.push({
           stroke: color, width: 2, spanGaps: true,
-          dash: dashed ? [6, 6] : undefined, points: { show: false },
+          dash, points: { show: false },
         });
       }
     }
@@ -659,14 +679,18 @@ function renderTooltip(chart, u) {
   const idx = u.cursor.idx;
   if (idx == null || u.cursor.left < 0) { hideTooltip(); return; }
   const wantKind = state.smoothing > 0 ? "smooth" : "main";
+  const xv = u.data[0][idx];
   const rows = [];
   for (let si = 1; si < u.data.length; si++) {
     const m = chart.seriesMeta[si - 1];
     if (!m || (m.kind !== wantKind && m.kind !== "main")) continue;
+    // cursor idxs are snapped to each series' nearest non-null point, which
+    // can sit at a different x than the shared cursor — record the actual x
+    // so runs with different logging cadences are never mislabeled
     const di = (u.cursor.idxs && u.cursor.idxs[si] != null) ? u.cursor.idxs[si] : idx;
     const v = u.data[si][di];
     if (v == null) continue;
-    rows.push({ run: m.run, v, py: u.valToPos(v, "y") });
+    rows.push({ run: m.run, v, x: u.data[0][di], py: u.valToPos(v, "y") });
   }
   if (!rows.length) { hideTooltip(); return; }
   rows.sort((a, b) => b.v - a.v);
@@ -676,12 +700,12 @@ function renderTooltip(chart, u) {
     if (d < best) { best = d; nearest = r; }
   }
   tooltipEl.textContent = "";
-  const xv = u.data[0][idx];
-  let xlabel;
-  if (state.xmode === "step") xlabel = "step " + xv.toLocaleString();
-  else if (state.xmode === "rel") xlabel = xv.toFixed(2) + " h";
-  else xlabel = new Date(xv * 1000).toLocaleString();
-  tooltipEl.appendChild(el("div", "tt-x", xlabel));
+  const fmtX = (x) => {
+    if (state.xmode === "step") return "step " + x.toLocaleString();
+    if (state.xmode === "rel") return x.toFixed(2) + " h";
+    return new Date(x * 1000).toLocaleString();
+  };
+  tooltipEl.appendChild(el("div", "tt-x", fmtX(xv)));
   for (const r of rows.slice(0, 14)) {
     const row = el("div", "tt-row" + (r === nearest ? " near" : ""));
     const chip = el("span", "chip");
@@ -690,6 +714,7 @@ function renderTooltip(chart, u) {
       `repeating-linear-gradient(45deg, ${runColor(r.run)} 0 2px, transparent 2px 4px)`;
     row.appendChild(chip);
     row.appendChild(el("span", "nm", runName(r.run)));
+    if (r.x !== xv) row.appendChild(el("span", "at", "@ " + fmtX(r.x)));
     row.appendChild(el("span", "val", fmtVal(r.v)));
     tooltipEl.appendChild(row);
   }
@@ -781,11 +806,7 @@ function rebuildStructure() {
 
   $("empty-hint").classList.toggle("hidden", state.selected.length > 0);
 
-  // drop charts whose tag left the visible universe
-  for (const [tag, chart] of [...charts.entries()]) {
-    if (!tagSet.has(tag)) { chart.destroy(); charts.delete(tag); }
-  }
-
+  const rendered = new Set();
   const getChart = (tag) => {
     let c = charts.get(tag);
     if (!c) { c = new ChartCard(tag); charts.set(tag, c); }
@@ -801,6 +822,7 @@ function rebuildStructure() {
     const c = getChart(tag);
     c.setPinned(true);
     pinGrid.appendChild(c.el);
+    rendered.add(tag);
     budget--;
   }
 
@@ -836,12 +858,7 @@ function rebuildStructure() {
         const c = getChart(tag);
         c.setPinned(false);
         grid.appendChild(c.el);
-      }
-    } else {
-      // collapsed: detach any existing cards so they stop observing viewport
-      for (const tag of tags) {
-        const c = charts.get(tag);
-        if (c) c.el.remove();
+        rendered.add(tag);
       }
     }
     groupsEl.appendChild(sec);
@@ -849,6 +866,13 @@ function rebuildStructure() {
   if (truncated > 0) {
     groupsEl.appendChild(el("div", "section-head",
       `⚠ ${truncated} more charts not shown (cap ${MAX_CARDS}) — filter tags or collapse groups`));
+  }
+
+  // destroy every chart not rendered this pass (filtered out, collapsed, or
+  // its tag left the selection) — otherwise the map grows unboundedly across
+  // filter changes; re-showing one is a cheap warm-cache refetch
+  for (const [tag, chart] of [...charts.entries()]) {
+    if (!rendered.has(tag)) { chart.destroy(); charts.delete(tag); }
   }
 
   // cards already on screen get no new IntersectionObserver event, so a
@@ -900,7 +924,11 @@ function bindControls() {
     $("smoothing-val").textContent = state.smoothing;
     saveState();
     clearTimeout(bindControls._st);
-    bindControls._st = setTimeout(() => { for (const c of charts.values()) if (c.visible) c.render(); }, 120);
+    // smoothing is server-computed over full-resolution data, so a new alpha
+    // means a refetch for visible charts (wanted() flags the mismatch)
+    bindControls._st = setTimeout(() => {
+      for (const c of charts.values()) if (c.visible) { c.ensureData(); c.render(); }
+    }, 300);
   };
 
   const xmode = $("xmode");
@@ -939,8 +967,18 @@ function bindControls() {
 
   $("refresh-now").onclick = async () => {
     await fetchRuns(true);
-    await fetchTags();
-    for (const c of charts.values()) if (c.visible) c.ensureData();
+    await fetchTags(true); // force=true bypasses the server's stat throttle
+    forceNextFetch = true; // ...and so does the next scalar batch
+    for (const c of charts.values()) {
+      if (!c.visible) continue;
+      for (const rid of state.selected) {
+        const t = tagsByRun.get(rid);
+        if (t && t.has(c.tag)) {
+          const d = c.data.get(rid);
+          enqueueFetch(rid, c.tag, d ? d.version : undefined);
+        }
+      }
+    }
   };
 
   const themeBtn = $("theme-btn");
@@ -976,11 +1014,11 @@ function bindControls() {
 
   $("select-visible").onclick = () => {
     const match = matcher(runSearch);
-    const vis = runs.filter((r) => match(runName(r.id)) || match(r.id));
-    const room = MAX_SELECT_VISIBLE - state.selected.length;
-    if (vis.length > room) alert(`Selecting the first ${Math.max(0, room)} of ${vis.length} matches (cap ${MAX_SELECT_VISIBLE} selected runs).`);
+    const vis = runs.filter((r) => matchesRun(match, r));
+    const room = MAX_SELECTED - state.selected.length;
+    if (vis.length > room) alert(`Selecting the first ${Math.max(0, room)} of ${vis.length} matches (cap ${MAX_SELECTED} selected runs).`);
     for (const r of vis) {
-      if (state.selected.length >= MAX_SELECT_VISIBLE) break;
+      if (state.selected.length >= MAX_SELECTED) break;
       if (!state.selected.includes(r.id)) {
         state.selected.push(r.id);
         assignSlot(r.id);

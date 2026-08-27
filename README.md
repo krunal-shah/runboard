@@ -8,7 +8,8 @@ Built 2026-08-27 to fix five specific TensorBoard pains:
 
 1. **Run selection** — sidebar with search (`words` or `/regex/`), one-click
    checkboxes, `+ visible` / `clear`, and a pinned "selected" section at the
-   top that doubles as the global legend.
+   top that doubles as the global legend. Search also matches symlink aliases
+   (e.g. a resume job id pointing at the same run dir).
 2. **Pinning that works** — the 📌 on any chart moves it to a Pinned section at
    the top of the page. Persisted in the browser.
 3. **Rearranging** — drag pinned cards by the ⠿ handle to reorder. Persisted.
@@ -18,9 +19,12 @@ Built 2026-08-27 to fix five specific TensorBoard pains:
    for contrast + color-blind separation in light and dark mode (see
    `docs/palette.md` note below). Slots are assigned in selection order and
    sticky — deselecting a run never recolors the others. Runs 9+ reuse the
-   palette dashed.
+   palette with distinct dash patterns (selection is capped at 30 runs so
+   every combination stays distinguishable).
 
-Also: TB-style debiased EMA smoothing (raw curve stays visible underneath),
+Also: TB-style debiased EMA smoothing, computed **server-side over the
+full-resolution series** before downsampling so alpha means the same thing at
+every zoom level (raw curve stays visible underneath),
 log-scale per chart, x-axis as step / relative hours / wall clock, linked
 drag-zoom across all charts (double-click resets), live-run indicators, 30 s
 auto-refresh with **incremental** event-file parsing (only new bytes are read),
@@ -58,7 +62,12 @@ numpy, tensorboard (only for the `Event` protobuf).
   parsed (offset tracked per file), so live-following is cheap. Runs are
   parsed lazily on first selection and LRU-evicted above ~30 M points.
 - **Resume semantics**: duplicate steps (crash → resume from an earlier
-  checkpoint) resolve last-write-wins after a stable sort by step.
+  checkpoint) resolve last-write-wins after a stable sort by step. A replaced,
+  truncated, or deleted event file triggers a full reparse of that run so no
+  stale points linger.
+- **Tooltips are honest about cadence**: each series snaps to its own nearest
+  point, and when that point's x differs from the cursor the row shows
+  `@ step N` — runs logged at different cadences are never mislabeled.
 - **Downsampling**: per-bucket min+max (~1 200 points per series), so spikes
   are never smoothed away by decimation.
 - **Client state** (selection, aliases, pins, order, log toggles, theme) lives
